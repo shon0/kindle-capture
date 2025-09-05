@@ -17,11 +17,18 @@ DIRECTION=${DIRECTION:-right}
 # 自動モード用の安全上限（0=無制限）
 MAX_PAGES=${MAX_PAGES:-0}
 
+# 重複ページ検出のしきい値（画像比較用）
+# ImageMagick がある場合: -fuzz に渡す割合（例: 0.5%）
+FUZZ_PERCENT=${FUZZ_PERCENT:-0.5%}
+# sips で BMP に変換して比較するフォールバックを使うか（true/false）
+SIPS_FALLBACK=${SIPS_FALLBACK:-true}
+
 # 対象アプリ識別子（環境に合わせて上書き可）
 KINDLE_BUNDLE_ID=${KINDLE_BUNDLE_ID:-com.amazon.Kindle}
 KINDLE_APP_NAME=${KINDLE_APP_NAME:-Kindle}
 
 readonly INTERVAL TOP_PAD LEFT_PAD RIGHT_PAD BOTTOM_PAD ACTIVATE_EVERY DIRECTION KINDLE_BUNDLE_ID KINDLE_APP_NAME MAX_PAGES
+readonly FUZZ_PERCENT SIPS_FALLBACK
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "${script_dir}/.." && pwd)
@@ -194,6 +201,78 @@ build_pdf() {
   img2pdf "${shots_dir}"/page_*.png -o "${pdf_path}"
 }
 
+# 見た目が同一かを判定（0: 同一, 1: 相違, その他: 失敗だが相違とみなす）
+images_equal() {
+  local a="$1" b="$2"
+
+  # 1) ImageMagick の compare が使える場合（最も確実）
+  if command -v magick >/dev/null 2>&1 || command -v compare >/dev/null 2>&1; then
+    # コマンド名を決定
+    local cmp_cmd ident_cmd
+    if command -v magick >/dev/null 2>&1; then
+      cmp_cmd=(magick compare)
+      ident_cmd=(magick identify)
+    else
+      cmp_cmd=(compare)
+      ident_cmd=(identify)
+    fi
+
+    # 総画素数を取得（割合判定に利用）
+    local total_pixels
+    if total_pixels=$("${ident_cmd[@]}" -format '%[fx:w*h]' "$a" 2>/dev/null); then
+      :
+    else
+      total_pixels=0
+    fi
+
+    # AE: 差分ピクセル数、fuzz: 指定割合以内の色差は同一扱い
+    local diff_pixels
+    diff_pixels=$("${cmp_cmd[@]}" -metric AE -fuzz "$FUZZ_PERCENT" "$a" "$b" null: 2>&1 || true)
+
+    # diff_pixels が数値で、0 なら同一
+    if [[ "$diff_pixels" =~ ^[0-9]+$ ]]; then
+      if [ "$diff_pixels" -eq 0 ]; then
+        return 0
+      fi
+      # 画像サイズが分かれば極小割合（例: 0.001% 未満）も同一扱い
+      if [ "$total_pixels" -gt 0 ]; then
+        # 0.001% (= 1e-5) を閾値にする
+        # bash で浮動小数が扱えないため、整数演算に変換: diff * 1_000_000 / total <= 100 (≒ 0.0001%)
+        local scaled=$(( diff_pixels * 1000000 / total_pixels ))
+        if [ "$scaled" -le 100 ]; then
+          return 0
+        fi
+      fi
+      return 1
+    fi
+    # 数値が取れない場合は相違とみなす
+    return 1
+  fi
+
+  # 2) sips フォールバック: BMP へ無圧縮変換してバイト比較
+  if [ "$SIPS_FALLBACK" = true ] && command -v sips >/dev/null 2>&1; then
+    local ta tb rc=1
+    ta=$(/usr/bin/mktemp -t kc_a.XXXXXX).bmp || return 1
+    tb=$(/usr/bin/mktemp -t kc_b.XXXXXX).bmp || { /bin/rm -f -- "$ta"; return 1; }
+    # 変換（quiet）
+    /usr/bin/sips -s format bmp "$a" --out "$ta" >/dev/null 2>&1 || true
+    /usr/bin/sips -s format bmp "$b" --out "$tb" >/dev/null 2>&1 || true
+    if /usr/bin/cmp -s "$ta" "$tb"; then
+      rc=0
+    else
+      rc=1
+    fi
+    /bin/rm -f -- "$ta" "$tb" || true
+    return "$rc"
+  fi
+
+  # 3) 最後の手段: バイト比較（PNG のメタデータ差で誤判定の可能性あり）
+  if /usr/bin/cmp -s "$a" "$b"; then
+    return 0
+  fi
+  return 1
+}
+
 pdf_only_mode=false
 
 case "${1-}" in
@@ -289,8 +368,8 @@ while : ; do
   fname="${SHOTS_DIR}/page_$(zpad3 "$next_index").png"
   /usr/sbin/screencapture -R "${rx},${ry},${rw},${rh}" -x "${fname}"
 
-  # 前ページと完全一致ならページが進んでいない=最終ページと判断
-  if [ -n "$prev_file" ] && /usr/bin/cmp -s "$prev_file" "$fname"; then
+  # 前ページと実質同一ならページが進んでいない=最終ページと判断
+  if [ -n "$prev_file" ] && images_equal "$prev_file" "$fname"; then
     # 重複画像を削除して停止
     /bin/rm -f -- "$fname"
     notifier "最終ページを検出: ${TITLE}"
